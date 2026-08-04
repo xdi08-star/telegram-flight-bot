@@ -7,7 +7,7 @@ from typing import Optional
 import aiosqlite
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -134,7 +134,118 @@ async def add_user(user_id: int):
         await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         await db.commit()
 
-# ================== КОМАНДЫ ==================
+async def get_all_users():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+# ================== AVIATIONSTACK ==================
+async def get_flight_status(flight_iata: str, flight_date: str) -> Optional[dict]:
+    url = "http://api.aviationstack.com/v1/flights"
+    params = {
+        "access_key": AVIA_KEY,
+        "flight_iata": flight_iata,
+        "flight_date": flight_date
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=20) as resp:
+                data = await resp.json()
+                if data.get("data") and len(data["data"]) > 0:
+                    return data["data"][0]
+                return None
+    except Exception as e:
+        logging.error(f"Ошибка API: {e}")
+        return None
+
+def format_status(flight_info: dict, status_data: Optional[dict]) -> str:
+    text = (
+        f"✈️ <b>{flight_info['flight_iata']}</b>\n"
+        f"📅 {flight_info['date']}\n"
+        f"🛫 {flight_info['from_city']} → {flight_info['to_city']}\n"
+        f"🕒 Вылет: {flight_info['dep_time']}\n"
+        f"🕒 Прилёт: {flight_info['arr_time']}\n\n"
+    )
+    
+    if not status_data:
+        text += "ℹ️ Статус пока недоступен"
+        return text
+
+    status = status_data.get("flight_status", "unknown").upper()
+    dep = status_data.get("departure", {}) or {}
+    arr = status_data.get("arrival", {}) or {}
+
+    status_map = {
+        "SCHEDULED": "🟢 По расписанию",
+        "ACTIVE": "🔵 В воздухе",
+        "LANDED": "✅ Приземлился",
+        "CANCELLED": "🔴 ОТМЕНЁН",
+        "INCIDENT": "🟠 Инцидент",
+        "DIVERTED": "🟡 Направлен в другой аэропорт"
+    }
+    text += f"<b>Статус:</b> {status_map.get(status, status)}\n"
+
+    if dep.get("delay"):
+        text += f"⚠️ Задержка вылета: <b>{dep['delay']} мин</b>\n"
+    if arr.get("delay"):
+        text += f"⚠️ Задержка прилёта: <b>{arr['delay']} мин</b>\n"
+
+    return text
+
+# ================== АВТОМАТИЧЕСКАЯ ПРОВЕРКА РЕЙСОВ ==================
+async def check_flights_job():
+    today = date.today()
+    users = await get_all_users()
+    if not users:
+        return
+
+    for f in FLIGHTS:
+        flight_date = datetime.strptime(f["date"], "%Y-%m-%d").date()
+        days_left = (flight_date - today).days
+
+        # Начинаем проверять за 5 дней до вылета
+        if 0 <= days_left <= 5:
+            status_data = await get_flight_status(f["flight_iata"], f["date"])
+            new_status = status_data.get("flight_status") if status_data else "no_data"
+
+            # Получаем старый статус
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute(
+                    "SELECT last_status FROM flight_status WHERE flight_id = ?", (f["id"],)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    old_status = row[0] if row else None
+
+            # Если статус изменился — срочно уведомляем
+            if new_status != old_status and new_status not in (None, "no_data"):
+                text = f"🔔 <b>Изменение по рейсу {f['flight_iata']}!</b>\n\n"
+                text += format_status(f, status_data)
+                for user_id in users:
+                    try:
+                        await bot.send_message(user_id, text, parse_mode="HTML")
+                    except Exception:
+                        pass
+
+            # Сохраняем статус
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO flight_status (flight_id, last_status, last_check) VALUES (?, ?, ?)",
+                    (f["id"], new_status, datetime.now().isoformat())
+                )
+                await db.commit()
+
+            # Ежедневное утреннее напоминание за 1–2 дня и в день вылета
+            if days_left in [0, 1, 2]:
+                text = f"☀️ Напоминание: до рейса {f['flight_iata']} осталось {days_left} дн.\n\n"
+                text += format_status(f, status_data)
+                for user_id in users:
+                    try:
+                        await bot.send_message(user_id, text, parse_mode="HTML")
+                    except Exception:
+                        pass
+
+# ================== КОМАНДЫ И МЕНЮ ==================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await add_user(message.from_user.id)
@@ -151,7 +262,6 @@ async def show_main_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ================== РЕЙСЫ ==================
 @dp.callback_query(F.data == "flights")
 async def show_flights(callback: CallbackQuery):
     today = date.today()
@@ -182,43 +292,31 @@ async def reminders_menu(callback: CallbackQuery):
 @dp.callback_query(F.data == "add_reminder")
 async def add_reminder_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_reminder)
-    await callback.message.edit_text(
-        "Напиши текст напоминания.\nНапример: <code>стрижка завтра</code> или <code>позвонить маме 5 августа</code>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("Напиши текст напоминания:")
     await callback.answer()
 
 @dp.message(Form.waiting_reminder)
 async def save_reminder(message: Message, state: FSMContext):
-    text = message.text
-    remind_date = (date.today() + timedelta(days=1)).isoformat()  # пока просто на завтра
-    
+    remind_date = (date.today() + timedelta(days=1)).isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "INSERT INTO reminders (user_id, text, remind_date) VALUES (?, ?, ?)",
-            (message.from_user.id, text, remind_date)
+            (message.from_user.id, message.text, remind_date)
         )
         await db.commit()
-    
     await state.clear()
-    await message.answer(f"✅ Напоминание сохранено:\n«{text}»", reply_markup=main_menu())
+    await message.answer(f"✅ Напоминание сохранено:\n«{message.text}»", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "list_reminders")
 async def list_reminders(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT id, text, remind_date FROM reminders WHERE user_id = ? AND sent = 0",
+            "SELECT text, remind_date FROM reminders WHERE user_id = ? AND sent = 0",
             (callback.from_user.id,)
         ) as cursor:
             rows = await cursor.fetchall()
     
-    if not rows:
-        text = "У тебя пока нет активных напоминаний."
-    else:
-        text = "📋 <b>Твои напоминания:</b>\n\n"
-        for r in rows:
-            text += f"• {r[1]} (на {r[2]})\n"
-    
+    text = "У тебя пока нет активных напоминаний." if not rows else "📋 <b>Твои напоминания:</b>\n\n" + "\n".join(f"• {r[0]} (на {r[1]})" for r in rows)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
     await callback.answer()
 
@@ -242,10 +340,7 @@ async def add_todo_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(Form.waiting_todo)
 async def save_todo(message: Message, state: FSMContext):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO todos (user_id, text) VALUES (?, ?)",
-            (message.from_user.id, message.text)
-        )
+        await db.execute("INSERT INTO todos (user_id, text) VALUES (?, ?)", (message.from_user.id, message.text))
         await db.commit()
     await state.clear()
     await message.answer("✅ Задача добавлена!", reply_markup=main_menu())
@@ -253,20 +348,13 @@ async def save_todo(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "list_todos")
 async def list_todos(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT id, text, done FROM todos WHERE user_id = ? ORDER BY done, id",
-            (callback.from_user.id,)
-        ) as cursor:
+        async with db.execute("SELECT text, done FROM todos WHERE user_id = ? ORDER BY done, id", (callback.from_user.id,)) as cursor:
             rows = await cursor.fetchall()
     
     if not rows:
         text = "Список дел пуст."
     else:
-        text = "✅ <b>Твои задачи:</b>\n\n"
-        for r in rows:
-            status = "✔️" if r[2] else "⬜"
-            text += f"{status} {r[1]}\n"
-    
+        text = "✅ <b>Твои задачи:</b>\n\n" + "\n".join(f"{'✔️' if r[1] else '⬜'} {r[0]}" for r in rows)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
     await callback.answer()
 
@@ -302,18 +390,12 @@ async def save_note(message: Message, state: FSMContext):
 async def list_notes(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT text, created FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            "SELECT text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10",
             (callback.from_user.id,)
         ) as cursor:
             rows = await cursor.fetchall()
     
-    if not rows:
-        text = "Заметок пока нет."
-    else:
-        text = "📝 <b>Последние заметки:</b>\n\n"
-        for r in rows:
-            text += f"• {r[0]}\n"
-    
+    text = "Заметок пока нет." if not rows else "📝 <b>Последние заметки:</b>\n\n" + "\n".join(f"• {r[0]}" for r in rows)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
     await callback.answer()
 
@@ -331,15 +413,11 @@ async def dates_menu(callback: CallbackQuery):
 @dp.callback_query(F.data == "add_date")
 async def add_date_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_date)
-    await callback.message.edit_text(
-        "Напиши в формате:\n<code>День рождения мамы 15.09</code>\nили\n<code>Паспорт до 12.2028</code>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("Напиши важную дату (например: День рождения мамы 15.09):")
     await callback.answer()
 
 @dp.message(Form.waiting_date)
 async def save_date(message: Message, state: FSMContext):
-    # Простое сохранение (можно потом улучшить парсинг)
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "INSERT INTO important_dates (user_id, title, date) VALUES (?, ?, ?)",
@@ -352,19 +430,10 @@ async def save_date(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "list_dates")
 async def list_dates(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT title FROM important_dates WHERE user_id = ?",
-            (callback.from_user.id,)
-        ) as cursor:
+        async with db.execute("SELECT title FROM important_dates WHERE user_id = ?", (callback.from_user.id,)) as cursor:
             rows = await cursor.fetchall()
     
-    if not rows:
-        text = "Важных дат пока нет."
-    else:
-        text = "📅 <b>Важные даты:</b>\n\n"
-        for r in rows:
-            text += f"• {r[0]}\n"
-    
+    text = "Важных дат пока нет." if not rows else "📅 <b>Важные даты:</b>\n\n" + "\n".join(f"• {r[0]}" for r in rows)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
     await callback.answer()
 
@@ -382,10 +451,7 @@ async def finance_menu(callback: CallbackQuery):
 @dp.callback_query(F.data == "add_expense")
 async def add_expense_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_expense)
-    await callback.message.edit_text(
-        "Напиши трату в формате:\n<code>1500 продукты</code>\nили\n<code>500 такси</code>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("Напиши трату (например: 1500 продукты):")
     await callback.answer()
 
 @dp.message(Form.waiting_expense)
@@ -394,24 +460,22 @@ async def save_expense(message: Message, state: FSMContext):
         parts = message.text.split(maxsplit=1)
         amount = float(parts[0].replace(",", "."))
         category = parts[1] if len(parts) > 1 else "другое"
-        
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 "INSERT INTO expenses (user_id, amount, category, created) VALUES (?, ?, ?, ?)",
                 (message.from_user.id, amount, category, datetime.now().isoformat())
             )
             await db.commit()
-        
         await state.clear()
         await message.answer(f"✅ Записал: {amount} ₽ — {category}", reply_markup=main_menu())
     except:
-        await message.answer("Не понял формат. Напиши, например:\n<code>1500 продукты</code>", parse_mode="HTML")
+        await message.answer("Не понял формат. Напиши, например:\n1500 продукты")
 
 @dp.callback_query(F.data == "list_expenses")
 async def list_expenses(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
-            "SELECT amount, category, created FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 15",
+            "SELECT amount, category FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 15",
             (callback.from_user.id,)
         ) as cursor:
             rows = await cursor.fetchall()
@@ -420,17 +484,19 @@ async def list_expenses(callback: CallbackQuery):
         text = "Трат пока нет."
     else:
         total = sum(r[0] for r in rows)
-        text = f"💰 <b>Последние траты:</b>\n\n"
-        for r in rows:
-            text += f"• {r[0]} ₽ — {r[1]}\n"
-        text += f"\n<b>Всего в списке: {total:.0f} ₽</b>"
-    
+        text = "💰 <b>Последние траты:</b>\n\n" + "\n".join(f"• {r[0]} ₽ — {r[1]}" for r in rows)
+        text += f"\n\n<b>Всего: {total:.0f} ₽</b>"
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
     await callback.answer()
 
 # ================== ЗАПУСК ==================
 async def main():
     await init_db()
+    
+    # Проверяем рейсы каждый день в 08:00 и 20:00
+    scheduler.add_job(check_flights_job, "cron", hour=8, minute=0)
+    scheduler.add_job(check_flights_job, "cron", hour=20, minute=0)
+    
     scheduler.start()
     logging.info("Бот запущен")
     await dp.start_polling(bot)
