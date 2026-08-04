@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 import aiosqlite
@@ -72,6 +72,23 @@ def main_menu():
 def back_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
+    ])
+
+def flights_menu():
+    kb = []
+    for f in FLIGHTS:
+        kb.append([InlineKeyboardButton(
+            text=f"✈️ {f['flight_iata']} | {f['date']}",
+            callback_data=f"flight_{f['id']}"
+        )])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def flight_detail_menu(flight_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data=f"check_{flight_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку рейсов", callback_data="flights")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main_menu")]
     ])
 
 # ================== БАЗА ДАННЫХ ==================
@@ -160,16 +177,21 @@ async def get_flight_status(flight_iata: str, flight_date: str) -> Optional[dict
         return None
 
 def format_status(flight_info: dict, status_data: Optional[dict]) -> str:
+    today = date.today()
+    flight_date = datetime.strptime(flight_info["date"], "%Y-%m-%d").date()
+    days_left = (flight_date - today).days
+
     text = (
         f"✈️ <b>{flight_info['flight_iata']}</b>\n"
         f"📅 {flight_info['date']}\n"
         f"🛫 {flight_info['from_city']} → {flight_info['to_city']}\n"
         f"🕒 Вылет: {flight_info['dep_time']}\n"
-        f"🕒 Прилёт: {flight_info['arr_time']}\n\n"
+        f"🕒 Прилёт: {flight_info['arr_time']}\n"
+        f"⏳ Осталось дней: <b>{days_left}</b>\n\n"
     )
     
     if not status_data:
-        text += "ℹ️ Статус пока недоступен"
+        text += "ℹ️ Статус пока недоступен (слишком рано или нет данных в системе)"
         return text
 
     status = status_data.get("flight_status", "unknown").upper()
@@ -184,18 +206,22 @@ def format_status(flight_info: dict, status_data: Optional[dict]) -> str:
         "INCIDENT": "🟠 Инцидент",
         "DIVERTED": "🟡 Направлен в другой аэропорт"
     }
-    text += f"<b>Статус:</b> {status_map.get(status, status)}\n"
+    text += f"<b>Текущий статус:</b> {status_map.get(status, status)}\n"
 
     if dep.get("delay"):
         text += f"⚠️ Задержка вылета: <b>{dep['delay']} мин</b>\n"
     if arr.get("delay"):
         text += f"⚠️ Задержка прилёта: <b>{arr['delay']} мин</b>\n"
 
+    if dep.get("estimated"):
+        text += f"Ожидаемый вылет: {str(dep['estimated'])[:16].replace('T', ' ')}\n"
+    if arr.get("estimated"):
+        text += f"Ожидаемый прилёт: {str(arr['estimated'])[:16].replace('T', ' ')}\n"
+
     return text
 
-# ================== ЛОГИКА ПРОВЕРОК ==================
+# ================== ЛОГИКА АВТОМАТИЧЕСКИХ ПРОВЕРОК ==================
 def should_check_now(flight: dict) -> bool:
-    """Решает, нужно ли сейчас делать запрос к API"""
     today = date.today()
     flight_date = datetime.strptime(flight["date"], "%Y-%m-%d").date()
     days_left = (flight_date - today).days
@@ -206,7 +232,7 @@ def should_check_now(flight: dict) -> bool:
     now = datetime.now()
     current_hour = now.hour
 
-    # За 3–5 дней: 4 раза в день (8, 12, 16, 20)
+    # За 2–5 дней: 4 раза в день
     if days_left >= 2:
         return current_hour in [8, 12, 16, 20]
 
@@ -228,7 +254,6 @@ async def check_flights_job():
         status_data = await get_flight_status(f["flight_iata"], f["date"])
         new_status = status_data.get("flight_status") if status_data else "no_data"
 
-        # Получаем старый статус
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
                 "SELECT last_status FROM flight_status WHERE flight_id = ?", (f["id"],)
@@ -236,7 +261,7 @@ async def check_flights_job():
                 row = await cursor.fetchone()
                 old_status = row[0] if row else None
 
-        # Если статус изменился — уведомляем всех
+        # Если статус изменился — уведомляем
         if new_status != old_status and new_status not in (None, "no_data"):
             text = f"🔔 <b>Изменение по рейсу {f['flight_iata']}!</b>\n\n"
             text += format_status(f, status_data)
@@ -246,7 +271,6 @@ async def check_flights_job():
                 except Exception:
                     pass
 
-        # Сохраняем новый статус
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO flight_status (flight_id, last_status, last_check) VALUES (?, ?, ?)",
@@ -271,21 +295,50 @@ async def show_main_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
+# ================== РЕЙСЫ ==================
 @dp.callback_query(F.data == "flights")
 async def show_flights(callback: CallbackQuery):
     today = date.today()
-    text = "✈️ <b>Твои рейсы:</b>\n\n"
-    for f in FLIGHTS:
-        flight_date = datetime.strptime(f["date"], "%Y-%m-%d").date()
-        days_left = (flight_date - today).days
-        text += (
-            f"<b>{f['flight_iata']}</b> | {f['date']}\n"
-            f"{f['from_city']} → {f['to_city']}\n"
-            f"Вылет: {f['dep_time']}\n"
-            f"⏳ Осталось дней: <b>{days_left}</b>\n\n"
-        )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_menu())
+    text = "✈️ <b>Твои рейсы:</b>\n\nВыбери рейс, чтобы посмотреть детали или проверить статус:"
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=flights_menu())
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("flight_"))
+async def show_flight_detail(callback: CallbackQuery):
+    flight_id = int(callback.data.split("_")[1])
+    f = next((x for x in FLIGHTS if x["id"] == flight_id), None)
+    if not f:
+        await callback.answer("Рейс не найден")
+        return
+
+    today = date.today()
+    flight_date = datetime.strptime(f["date"], "%Y-%m-%d").date()
+    days_left = (flight_date - today).days
+
+    text = (
+        f"✈️ <b>{f['flight_iata']}</b>\n"
+        f"📅 {f['date']}\n"
+        f"🛫 {f['from_city']} → {f['to_city']}\n"
+        f"🕒 Вылет: {f['dep_time']}\n"
+        f"🕒 Прилёт: {f['arr_time']}\n"
+        f"⏳ Осталось дней: <b>{days_left}</b>\n\n"
+        f"Нажми «Проверить сейчас», чтобы узнать актуальный статус."
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=flight_detail_menu(flight_id))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("check_"))
+async def manual_check(callback: CallbackQuery):
+    flight_id = int(callback.data.split("_")[1])
+    f = next((x for x in FLIGHTS if x["id"] == flight_id), None)
+    if not f:
+        await callback.answer("Рейс не найден")
+        return
+
+    await callback.answer("Проверяю статус...")
+    status_data = await get_flight_status(f["flight_iata"], f["date"])
+    text = format_status(f, status_data)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=flight_detail_menu(flight_id))
 
 # ================== НАПОМИНАНИЯ ==================
 @dp.callback_query(F.data == "reminders")
@@ -502,7 +555,7 @@ async def list_expenses(callback: CallbackQuery):
 async def main():
     await init_db()
     
-    # Запускаем проверку каждый час (логика внутри решает, делать ли запрос)
+    # Проверка каждый час (логика внутри решает, делать ли запрос)
     scheduler.add_job(check_flights_job, "interval", hours=1)
     
     scheduler.start()
