@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from typing import Optional
 
 import aiosqlite
@@ -193,57 +193,66 @@ def format_status(flight_info: dict, status_data: Optional[dict]) -> str:
 
     return text
 
-# ================== АВТОМАТИЧЕСКАЯ ПРОВЕРКА РЕЙСОВ ==================
-async def check_flights_job():
+# ================== ЛОГИКА ПРОВЕРОК ==================
+def should_check_now(flight: dict) -> bool:
+    """Решает, нужно ли сейчас делать запрос к API"""
     today = date.today()
+    flight_date = datetime.strptime(flight["date"], "%Y-%m-%d").date()
+    days_left = (flight_date - today).days
+
+    if days_left > 5 or days_left < 0:
+        return False
+
+    now = datetime.now()
+    current_hour = now.hour
+
+    # За 3–5 дней: 4 раза в день (8, 12, 16, 20)
+    if days_left >= 2:
+        return current_hour in [8, 12, 16, 20]
+
+    # За 1 день и в день вылета: каждый час
+    if days_left <= 1:
+        return True
+
+    return False
+
+async def check_flights_job():
     users = await get_all_users()
     if not users:
         return
 
     for f in FLIGHTS:
-        flight_date = datetime.strptime(f["date"], "%Y-%m-%d").date()
-        days_left = (flight_date - today).days
+        if not should_check_now(f):
+            continue
 
-        # Начинаем проверять за 5 дней до вылета
-        if 0 <= days_left <= 5:
-            status_data = await get_flight_status(f["flight_iata"], f["date"])
-            new_status = status_data.get("flight_status") if status_data else "no_data"
+        status_data = await get_flight_status(f["flight_iata"], f["date"])
+        new_status = status_data.get("flight_status") if status_data else "no_data"
 
-            # Получаем старый статус
-            async with aiosqlite.connect(DB_NAME) as db:
-                async with db.execute(
-                    "SELECT last_status FROM flight_status WHERE flight_id = ?", (f["id"],)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    old_status = row[0] if row else None
+        # Получаем старый статус
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT last_status FROM flight_status WHERE flight_id = ?", (f["id"],)
+            ) as cursor:
+                row = await cursor.fetchone()
+                old_status = row[0] if row else None
 
-            # Если статус изменился — срочно уведомляем
-            if new_status != old_status and new_status not in (None, "no_data"):
-                text = f"🔔 <b>Изменение по рейсу {f['flight_iata']}!</b>\n\n"
-                text += format_status(f, status_data)
-                for user_id in users:
-                    try:
-                        await bot.send_message(user_id, text, parse_mode="HTML")
-                    except Exception:
-                        pass
+        # Если статус изменился — уведомляем всех
+        if new_status != old_status and new_status not in (None, "no_data"):
+            text = f"🔔 <b>Изменение по рейсу {f['flight_iata']}!</b>\n\n"
+            text += format_status(f, status_data)
+            for user_id in users:
+                try:
+                    await bot.send_message(user_id, text, parse_mode="HTML")
+                except Exception:
+                    pass
 
-            # Сохраняем статус
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO flight_status (flight_id, last_status, last_check) VALUES (?, ?, ?)",
-                    (f["id"], new_status, datetime.now().isoformat())
-                )
-                await db.commit()
-
-            # Ежедневное утреннее напоминание за 1–2 дня и в день вылета
-            if days_left in [0, 1, 2]:
-                text = f"☀️ Напоминание: до рейса {f['flight_iata']} осталось {days_left} дн.\n\n"
-                text += format_status(f, status_data)
-                for user_id in users:
-                    try:
-                        await bot.send_message(user_id, text, parse_mode="HTML")
-                    except Exception:
-                        pass
+        # Сохраняем новый статус
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO flight_status (flight_id, last_status, last_check) VALUES (?, ?, ?)",
+                (f["id"], new_status, datetime.now().isoformat())
+            )
+            await db.commit()
 
 # ================== КОМАНДЫ И МЕНЮ ==================
 @dp.message(CommandStart())
@@ -493,9 +502,8 @@ async def list_expenses(callback: CallbackQuery):
 async def main():
     await init_db()
     
-    # Проверяем рейсы каждый день в 08:00 и 20:00
-    scheduler.add_job(check_flights_job, "cron", hour=8, minute=0)
-    scheduler.add_job(check_flights_job, "cron", hour=20, minute=0)
+    # Запускаем проверку каждый час (логика внутри решает, делать ли запрос)
+    scheduler.add_job(check_flights_job, "interval", hours=1)
     
     scheduler.start()
     logging.info("Бот запущен")
